@@ -1,0 +1,11 @@
+node_modules/
+.opencode/
+__pycache__/
+.venv/
+config.toml
+data/
+dist/
+build/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

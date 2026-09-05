@@ -1,0 +1,17 @@
+database_path = "/data/watch-state.sqlite3"
+watch_debounce_seconds = 30
+daily_reconcile_at = "03:00"
+source_boxes = ["Imbox", "Paper Trail"]
+travel_label = "Travel"
+default_timezone = "America/New_York"
+
+# Keep false until dry-run output has been reviewed.
+apply_changes = false
+
+# Set this if events should go to a specific writable HEY calendar.
+# calendar_id = 12345
+
+# hey_command = "hey"
+# opencode_command = "opencode"
+# model = "openai/gpt-5.6-luna"
+# work_path = "/tmp/hey-travel-sync"
