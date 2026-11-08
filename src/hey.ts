@@ -45,7 +45,8 @@ export class Hey {
     return postings.flatMap((posting) => {
       const topicId = Number(posting.topic_id);
       const postingId = Number(posting.id);
-      const revision = String(posting.updated_at ?? posting.active_at ?? posting.created_at ?? "");
+      // active_at moves only when mail arrives; updated_at also moves when we label the thread.
+      const revision = String(posting.active_at ?? posting.updated_at ?? posting.created_at ?? "");
       if (!Number.isInteger(topicId) || !Number.isInteger(postingId) || !revision) return [];
       return [{
         topicId, postingId, revision, receivedAt: revision,
