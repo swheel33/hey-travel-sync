@@ -12,7 +12,8 @@ Every `POLL_MINUTES` (default 5) the container:
    preview, and sender (`src/filter.ts`). Routine mail never reaches the model. A thread that
    has produced travel before is always re-read, so follow-ups such as cancellations are seen.
 3. Reads the thread and its attachments with the `hey` CLI and sends them to Claude in one
-   Messages API call with a JSON schema (`src/extract.ts`). The model has no tools.
+   Messages API call with a JSON schema (`src/extract.ts`), using Claude Haiku 5.5 at low effort
+   by default (`CLAUDE_MODEL`, `CLAUDE_EFFORT`). The model has no tools.
 4. Validates each reservation, renders its event (`src/reservation.ts`), and creates, updates,
    or deletes events recorded in SQLite (`src/store.ts`). It only touches events it created.
 
@@ -26,8 +27,8 @@ end (LGA → `America/New_York`, ORD → `America/Chicago`). The code turns thos
 the model never does offset arithmetic.
 
 A HEY event carries a single zone, so a transport event sits in the departure zone at the
-correct instants. When the arrival zone differs, the title ends with the local arrival time,
-for example `DL2513 LGA → ORD (arr 8:45 PM CST)`, and the notes give both local times. Hotel
+correct instants. When the arrival zone differs, the title ends with the local arrival time (and its date when it differs),
+for example `SQ023 JFK → SIN (arr Fri Dec 18, 6:00 AM local)`, and the notes give both local times. Hotel
 stays are all-day events from check-in to check-out.
 
 ## Safety

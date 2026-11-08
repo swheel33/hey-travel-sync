@@ -29,7 +29,7 @@ group("normalize", () => {
     const result = normalize(flight());
     if (typeof result === "string") throw new Error(result);
     expect(result.event).toMatchObject({
-      title: "DL2513 LGA → ORD (arr 8:45 PM CST)", timeZone: "America/New_York",
+      title: "DL2513 LGA → ORD (arr 8:45 PM local)", timeZone: "America/New_York",
       startDate: "2026-11-12", startTime: "18:55", endDate: "2026-11-12", endTime: "21:45",
     });
     expect(result.event!.notes).toContain("Arrives Thu, Nov 12, 8:45 PM CST · ORD");
@@ -41,7 +41,23 @@ group("normalize", () => {
       start: "2026-12-16T22:05", end: "2026-12-18T06:00", end_timezone: "Asia/Singapore",
     }));
     if (typeof result === "string") throw new Error(result);
-    expect(result.event).toMatchObject({ startDate: "2026-12-16", startTime: "22:05", endDate: "2026-12-17", endTime: "17:00" });
+    expect(result.event).toMatchObject({
+      title: "SQ23 JFK → SIN (arr Fri Dec 18, 6:00 AM local)", timeZone: "America/New_York",
+      startDate: "2026-12-16", startTime: "22:05", endDate: "2026-12-17", endTime: "17:00",
+    });
+    expect(result.event!.notes).toContain("Arrives Fri, Dec 18, 6:00 AM GMT+8 · SIN");
+  });
+
+  test("eastbound return across the date line keeps the true duration", () => {
+    const result = normalize(flight({
+      provider: "Singapore Airlines", number: "SQ24", origin: "SIN", destination: "JFK",
+      start: "2027-01-07T12:10", start_timezone: "Asia/Singapore", end: "2027-01-07T17:25", end_timezone: "America/New_York",
+    }));
+    if (typeof result === "string") throw new Error(result);
+    expect(result.event).toMatchObject({
+      title: "SQ24 SIN → JFK (arr 5:25 PM local)", timeZone: "Asia/Singapore",
+      startDate: "2027-01-07", startTime: "12:10", endDate: "2027-01-08", endTime: "06:25",
+    });
   });
 
   test("same-zone leg has no arrival suffix", () => {

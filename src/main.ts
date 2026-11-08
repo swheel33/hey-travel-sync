@@ -28,7 +28,7 @@ const hey = new Hey(config.heyCommand);
 
 switch (command) {
   case "run": {
-    const sync = new Sync(config, hey, new Extractor(config.model), new Store(config.databasePath));
+    const sync = new Sync(config, hey, new Extractor(config.model, config.effort), new Store(config.databasePath));
     let stopping = false;
     let wake = () => {};
     for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => { stopping = true; wake(); });
@@ -46,7 +46,7 @@ switch (command) {
   case "sync": {
     const topic = option("--thread");
     const since = option("--since-days");
-    const sync = new Sync(config, hey, new Extractor(config.model), new Store(config.databasePath));
+    const sync = new Sync(config, hey, new Extractor(config.model, config.effort), new Store(config.databasePath));
     report(await sync.run({
       apply: !flag("--dry-run"), all: flag("--all") || topic !== undefined,
       sinceDays: since ? Number(since) : undefined, topicId: topic ? Number(topic) : undefined,

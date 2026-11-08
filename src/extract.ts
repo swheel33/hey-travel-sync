@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
+import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import type { Attachment, Thread } from "./hey.ts";
 
@@ -8,7 +8,7 @@ const ExtractedReservation = z.object({
   status: z.enum(["confirmed", "cancelled"]),
   provider: z.string().describe("Airline, rail or bus operator, hotel/property, or restaurant name"),
   confirmation: z.string().describe("Booking reference / confirmation number, or empty"),
-  number: z.string().describe("Transport only: compact carrier code and number such as DL2513, else empty"),
+  number: z.string().describe("Flights: IATA carrier code and number such as DL2513. Trains and buses: the printed train or bus number only, such as 105. Else empty"),
   origin: z.string().describe("Transport only: departure airport/station code if shown (LGA), else its name"),
   destination: z.string().describe("Transport only: arrival airport/station code if shown (ORD), else its name"),
   location: z.string().describe("Lodging/restaurant street address, else empty"),
@@ -37,21 +37,19 @@ Return {"reservations": []} when there is nothing to report.`;
 export class Extractor {
   private client = new Anthropic();
 
-  constructor(private model: string) {}
+  constructor(private model: string, private effort: "low" | "medium" | "high") {}
 
   async extract(thread: Thread): Promise<ExtractedReservation[]> {
-    const content: Anthropic.Beta.BetaContentBlockParam[] = [
+    const content: Anthropic.ContentBlockParam[] = [
       ...thread.attachments.flatMap(attachmentBlock),
       { type: "text", text: thread.markdown },
     ];
-    const response = await this.client.beta.messages.parse({
+    const response = await this.client.messages.parse({
       model: this.model,
       max_tokens: 16000,
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
       system,
       messages: [{ role: "user", content }],
-      output_config: { effort: "medium", format: betaZodOutputFormat(Extraction) },
+      output_config: { effort: this.effort, format: zodOutputFormat(Extraction) },
     });
     if (response.stop_reason === "refusal") throw new Error("model declined the thread");
     if (response.stop_reason === "max_tokens") throw new Error("model output hit max_tokens");
@@ -64,7 +62,7 @@ const imageTypes: Record<string, "image/png" | "image/jpeg" | "image/gif" | "ima
   png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
 };
 
-function attachmentBlock(attachment: Attachment): Anthropic.Beta.BetaContentBlockParam[] {
+function attachmentBlock(attachment: Attachment): Anthropic.ContentBlockParam[] {
   const extension = attachment.filename.split(".").pop()?.toLowerCase() ?? "";
   const data = Buffer.from(attachment.content).toString("base64");
   if (extension === "pdf") {

@@ -48,9 +48,12 @@ export function describe(instant: Date, zone: string): string {
   }).format(instant).replace(" at ", ", ");
 }
 
-/** Short time label such as "8:45 PM CST". */
-export function shortTime(instant: Date, zone: string): string {
-  return new Intl.DateTimeFormat("en-US", { timeZone: zone, hour: "numeric", minute: "2-digit", timeZoneName: "short" }).format(instant);
+/** Local arrival label such as "8:45 PM local", or "Fri Dec 18, 6:00 AM local" when the day differs from `sameDayAs`. */
+export function arrivalLabel(instant: Date, zone: string, sameDayAs: string): string {
+  const time = new Intl.DateTimeFormat("en-US", { timeZone: zone, hour: "numeric", minute: "2-digit" }).format(instant);
+  if (wallClock(instant, zone).date === sameDayAs) return `${time} local`;
+  const day = new Intl.DateTimeFormat("en-US", { timeZone: zone, weekday: "short", month: "short", day: "numeric" }).format(instant);
+  return `${day.replace(",", "")}, ${time} local`;
 }
 
 export function addDays(date: string, days: number): string {

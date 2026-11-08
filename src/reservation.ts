@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ExtractedReservation } from "./extract.ts";
 import type { EventInput } from "./hey.ts";
-import { describe, isDate, isLocalDateTime, isZone, shortTime, toInstant, wallClock } from "./time.ts";
+import { describe, isDate, isLocalDateTime, isZone, arrivalLabel, toInstant, wallClock } from "./time.ts";
 
 export interface Reservation {
   key: string;
@@ -77,8 +77,9 @@ function timedEvent(value: ExtractedReservation): EventInput | string {
   const notes: string[] = [];
   if (transport.has(value.kind)) {
     const route = [value.origin, value.destination].filter(Boolean).join(" → ");
-    title = [value.number || value.provider, route].filter(Boolean).join(" ");
-    if (crossesZones) title += ` (arr ${shortTime(end, endZone)})`;
+    const service = value.kind === "flight" ? value.number || value.provider : [value.provider, value.number].filter(Boolean).join(" ");
+    title = [service, route].filter(Boolean).join(" ");
+    if (crossesZones) title += ` (arr ${arrivalLabel(end, endZone, value.start.slice(0, 10))})`;
     notes.push(`Departs ${describe(start, startZone)}${value.origin ? ` · ${value.origin}` : ""}`);
     notes.push(`Arrives ${describe(end, endZone)}${value.destination ? ` · ${value.destination}` : ""}`);
     if (value.number) notes.push(value.provider);
