@@ -1,147 +1,78 @@
 # HEY Travel Sync
 
-HEY Travel Sync reads reservation mail from configured HEY boxes and reconciles
-application-owned HEY Calendar events. The default sources are `Imbox` and `Paper Trail`.
-Calendar writes are disabled by default.
+Reads reservation mail from HEY and keeps HEY Calendar events for flights, trains, buses, hotel
+stays, and restaurant bookings.
 
-## Architecture
+## How it works
 
-1. HEY posting subject, summary, sender, and attachment/calendar indicators are scored locally
-   using travel, reservation, provider, disruption, structure, and marketing signals. Forwarding
-   is not a signal. Non-candidates are counted as `filtered`; their threads are not downloaded and
-   no model is called. Updates to previously extracted topics bypass this filter.
-2. Candidate threads are fetched as HEY JSON. Their Markdown bodies are assembled oldest first
-   with sender, date, and entry ID metadata, and attachments are downloaded.
-3. OpenCode runs an isolated, invocation-only `travel-extractor` agent with
-   `openai/gpt-5.6-luna`. The agent has no tool, filesystem, or network permissions and receives
-   only files attached by the CLI invocation.
-4. TypeScript validates exact JSON and derives reservation identity and calendar titles locally.
-   SQLite reconciliation limits updates and deletes to events created by this app.
-5. `hey watch` supplies posting changes. Changes for one topic are debounced and all work is
-   strictly single-flight; resync notifications and the daily wall-clock pass scan all pages.
+Every `POLL_MINUTES` (default 5) the container:
 
-Supported reservations are flights, trains, buses, lodging, and restaurants. Transport legs
-become separate events. Exact duplicate extraction results merge; conflicting results for one
-segment fail the thread and are retried on a later pass.
+1. Lists the newest 50 threads in each box in `HEY_BOXES` (default `Imbox`, `Paper Trail`).
+2. Skips threads it has already handled at the same revision, and scores the rest on subject,
+   preview, and sender (`src/filter.ts`). Routine mail never reaches the model. A thread that
+   has produced travel before is always re-read, so follow-ups such as cancellations are seen.
+3. Reads the thread and its attachments with the `hey` CLI and sends them to Claude in one
+   Messages API call with a JSON schema (`src/extract.ts`). The model has no tools.
+4. Validates each reservation, renders its event (`src/reservation.ts`), and creates, updates,
+   or deletes events recorded in SQLite (`src/store.ts`). It only touches events it created.
 
-## Privacy
+A failed thread is retried with an hourly backoff, up to three times per revision. `status` lists
+failures.
 
-Candidate email Markdown and attachments are sent to the configured OpenCode model provider for
-extraction. Mode-`0600` temporary files are removed after the invocation. Raw bodies and
-attachments are never stored in the application SQLite database. OpenCode retains its own local
-session records under `/data/home/.local/share`; those records can include attached email content
-and provide historical token usage. OpenCode session sharing is disabled. The application SQLite
-database stores posting revisions, validated extraction results, normalized reservations, and
-owned event links. Non-candidate message metadata is examined locally only.
+## Time zones
 
-Email and attachments are untrusted input. The extractor prompt tells the model to ignore all
-instructions in them, requires exact JSON, and the local validator rejects malformed output,
-unknown or extra keys, unsupported kinds/statuses, oversized strings, invalid dates/time zones,
-and incomplete reservations. Rejected output is not marked ignored, so it is retried.
+The model copies every time as printed, local to its place, and names the IANA zone of each
+end (LGA → `America/New_York`, ORD → `America/Chicago`). The code turns those into instants;
+the model never does offset arithmetic.
 
-## Requirements
+A HEY event carries a single zone, so a transport event sits in the departure zone at the
+correct instants. When the arrival zone differs, the title ends with the local arrival time,
+for example `DL2513 LGA → ORD (arr 8:45 PM CST)`, and the notes give both local times. Hotel
+stays are all-day events from check-in to check-out.
 
-- Bun 1.4
-- HEY CLI 1.4.0
-- OpenCode 1.18.25
-- OpenCode authentication for the configured model (default `openai/gpt-5.6-luna`)
+## Safety
+
+- Email is untrusted. The prompt says so, the model has no tools, and output must match a schema.
+- A cancellation deletes an event only when the email literally says "cancel" and the confirmation
+  matches an event this app created.
+- Reminders without times, and stays without a check-out, are skipped rather than guessed.
+- A thread whose body comes back empty fails loudly. That is how the old HEY CLI 1.4 broke:
+  it rendered whole emails as `📎 attachment`.
+- An event row with no ID means a create was interrupted. `status` shows it as `UNFINISHED`;
+  check HEY Calendar for a stray event, then delete the row.
 
 ## Setup
 
 ```sh
-bun install --frozen-lockfile
-cp config.example.toml config.toml
-hey auth login
-opencode auth login
-bun run src/cli.ts doctor --config config.toml
-bun run src/cli.ts sync --dry-run --config config.toml
-```
-
-Review dry-run actions before enabling writes. A dry run caches validated extraction, so a later
-apply reconciles it without another model call. Sync and watch mode may also use
-`apply_changes = true`; explicit `--dry-run` always overrides it.
-
-```sh
-bun run src/cli.ts sync --apply --config config.toml
-bun run src/cli.ts watch --apply --config config.toml
-```
-
-Backfill is dry-run unless `--apply` is explicitly supplied, regardless of configuration:
-
-```sh
-bun run src/cli.ts backfill --since-days 90 --dry-run --config config.toml
-bun run src/cli.ts backfill --since-days 90 --apply --config config.toml
-```
-
-## Cancellation Policy
-
-A model cancellation can delete an event only when all of these conditions hold:
-
-- The raw HEY Markdown contains the explicit word `cancel`, `cancelled`, `canceled`, or
-  `cancellation`.
-- The extracted cancellation has a non-empty provider and confirmation reference.
-- Exactly one event recorded as owned by this application matches kind, provider, and
-  confirmation; a supplied flight, train, or bus segment must also match.
-
-Providerless fuzzy deletion is never allowed. An ambiguous cancellation, a cancellation with no
-owned match, or one without explicit raw wording remains pending and is retried. Confirmed updates
-retain the same ownership and confirmation matching protections. Confirmation-free confirmed
-events are create-only.
-
-## Safety
-
-- Created events carry a `hey-travel-sync:v1` ownership note with reservation and segment keys.
-- Threads are processed oldest first so later changes win during initial sync and backfill.
-- An interrupted pending calendar operation blocks that event scope for manual verification.
-- For a pending-operation error, inspect HEY Calendar first. Do not clear the pending row until
-  verifying whether the remote create, update, or delete completed; otherwise a retry can create a
-  duplicate event. Restore the state database from backup if the local outcome cannot be reconciled.
-- Temporary extraction files are removed whether extraction succeeds or fails.
-- The watch-driven schema is greenfield. Point `database_path` at a new file when replacing the
-  retired polling release. The default is `/data/watch-state.sqlite3`, which leaves the retired
-  database and `/data/home` credentials untouched.
-- Keep one running replica because SQLite state is stored on one volume.
-
-## Docker
-
-The image pins Bun 1.4.0, HEY 1.4.0, and OpenCode 1.18.25. HEY and OpenCode release artifacts
-are checksum-verified during the build. The image has no Qt or KDE extraction dependencies.
-
-```sh
-cp config.example.toml config.toml
+cp .env.example .env              # set ANTHROPIC_API_KEY
 docker compose build
-docker run --rm -it --network host \
-  -e HOME=/data/home -e XDG_CONFIG_HOME=/data/home/.config -e XDG_DATA_HOME=/data/home/.local/share \
-  -e HEY_NO_KEYRING=1 -v hey-travel-sync_hey-travel-data:/data \
-  --entrypoint hey hey-travel-sync:local auth login --no-browser
-docker run --rm -it --network host \
-  -e HOME=/data/home -e XDG_CONFIG_HOME=/data/home/.config -e XDG_DATA_HOME=/data/home/.local/share \
-  -v hey-travel-sync_hey-travel-data:/data \
-  --entrypoint opencode hey-travel-sync:local auth login
+docker compose run --rm --entrypoint hey sync auth login --no-browser   # first time only
 docker compose run --rm sync doctor
-docker compose run --rm sync sync --dry-run
-docker compose run --rm sync backfill --since-days 90 --dry-run
-docker compose run --rm sync sync --apply
+docker compose run --rm sync sync --dry-run --all --since-days 90
+docker compose up -d
 ```
 
-`XDG_DATA_HOME` is under the persistent `/data` volume, so OpenCode authentication survives
-container replacement. HEY authentication and OpenCode session/token history are persisted there
-as well. Do not mount host credential files into the container. Historical model usage is
-available with:
+HEY credentials live in the `/data` volume. Other commands:
 
 ```sh
-docker compose run --rm --no-deps --entrypoint opencode sync stats --models
+docker compose run --rm sync sync --dry-run --thread 2179079110   # debug one thread
+docker compose run --rm sync status
 ```
 
-Ignore OpenCode's subscription cost field when applying public per-token prices. The per-model
-output count includes reasoning tokens. After validating one controlled `--apply`, set
-`apply_changes = true`, run `docker compose up -d`, and confirm `HEY watch ready` in the logs.
+## Moving from the OpenCode release
 
-## Limitations
+The old release kept its state in `/data/watch-state.sqlite3`. Adopt the events it created so they
+are updated rather than duplicated, then backfill:
 
-- HEY Calendar applies one timezone to both event boundaries; offset-bearing arrival times are
-  converted to the departure timezone.
-- A crash after a successful remote create but before its event ID is persisted requires manual
-  inspection of ownership notes.
-- Normal sync checks the newest 50 threads per source box. Backfill, watch resync, and the daily
-  reconciliation request all pages.
+```sh
+docker compose run --rm sync import-legacy /data/watch-state.sqlite3
+docker compose run --rm sync sync --all --since-days 120
+```
+
+## Development
+
+```sh
+bun install
+bun test
+bun run typecheck
+```

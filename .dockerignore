@@ -3,6 +3,5 @@
 node_modules
 build
 dist
-tests
 data
 config.toml

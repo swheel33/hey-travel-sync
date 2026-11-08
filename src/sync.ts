@@ -1,268 +1,139 @@
-import { randomUUID } from "node:crypto";
 import type { Config } from "./config.ts";
-import { digest, eventSpec, identify, normalizeSegment, type CalendarPlan, type EventLink, type IdentifiedReservation } from "./types.ts";
-import { StateDatabase, type CachedExtraction } from "./database.ts";
-import { HeyClient, scoreTravelCandidate, travelFilterVersion, type ThreadRef } from "./hey.ts";
-import { OpenCodeExtractor } from "./extractor.ts";
+import type { Extractor } from "./extract.ts";
+import { travelScore } from "./filter.ts";
+import type { Hey, ThreadRef } from "./hey.ts";
+import { bookingPrefix, eventHash, normalize, type Reservation } from "./reservation.ts";
+import type { Store } from "./store.ts";
 
-const pipelineVersion = "opencode-v4-zoned-times";
+const maxAttempts = 3;
 
-export interface SyncSummary {
-  checked: number;
-  filtered: number;
-  modelCalls: number;
-  ignored: number;
-  reservations: number;
-  creates: number;
-  updates: number;
-  deletes: number;
-  errors: number;
-}
-
-interface SyncOptions {
+export interface SyncOptions {
   apply: boolean;
-  allPages?: boolean;
+  all?: boolean;
   sinceDays?: number;
-  signal?: AbortSignal;
+  topicId?: number;
 }
 
-export class SyncService {
-  constructor(private config: Config, private database: StateDatabase, private hey: HeyClient, private extractor: OpenCodeExtractor) {}
+export interface Summary {
+  seen: number;
+  filtered: number;
+  extracted: number;
+  created: number;
+  updated: number;
+  deleted: number;
+  failed: number;
+}
 
-  async sync(options: SyncOptions): Promise<SyncSummary> {
+export class Sync {
+  constructor(private config: Config, private hey: Hey, private extractor: Extractor, private store: Store) {}
+
+  async run(options: SyncOptions): Promise<Summary> {
+    const summary: Summary = { seen: 0, filtered: 0, extracted: 0, created: 0, updated: 0, deleted: 0, failed: 0 };
     const refs = new Map<number, ThreadRef>();
-    for (const box of this.config.sourceBoxes) {
-      for (const ref of await this.hey.listBox(box, options.allPages)) {
-        const current = refs.get(ref.topicId);
-        if (!current || Date.parse(ref.receivedAt) > Date.parse(current.receivedAt)) refs.set(ref.topicId, ref);
+    for (const box of this.config.boxes) {
+      for (const ref of await this.hey.listBox(box, Boolean(options.all))) {
+        if (options.topicId !== undefined && ref.topicId !== options.topicId) continue;
+        const known = refs.get(ref.topicId);
+        if (!known || ref.receivedAt > known.receivedAt) refs.set(ref.topicId, ref);
       }
     }
-    const ordered = [...refs.values()].sort(chronological);
-    return this.processRefs(ordered, options);
-  }
-
-  async targeted(refs: ThreadRef[], options: SyncOptions): Promise<SyncSummary> {
-    return this.processRefs([...refs].sort(chronological), options);
-  }
-
-  private async processRefs(refs: ThreadRef[], options: SyncOptions): Promise<SyncSummary> {
-    const summary = emptySummary();
-    const preview = new Map<string, string>();
+    const cutoff = options.sinceDays === undefined ? "" : new Date(Date.now() - options.sinceDays * 86_400_000).toISOString();
+    // Oldest first, so a later change to a booking wins.
+    const ordered = [...refs.values()].filter((ref) => ref.receivedAt >= cutoff).sort((a, b) => a.receivedAt.localeCompare(b.receivedAt));
     const labelId = options.apply ? await this.hey.labelId(this.config.travelLabel) : undefined;
-    if (options.apply && labelId === undefined) throw new Error(`HEY label not found: ${this.config.travelLabel}`);
-    for (const ref of refs) {
-      if (options.signal?.aborted) throw options.signal.reason;
-      await this.process(ref, labelId, options, summary, preview);
+    for (const ref of ordered) {
+      summary.seen++;
+      try {
+        await this.thread(ref, options, summary, labelId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        summary.failed++;
+        console.error(`FAILED thread ${ref.topicId} "${ref.subject}": ${message}`);
+        if (options.apply) this.store.saveThread(ref.topicId, ref.revision, ref.subject, "failed", message);
+      }
     }
     return summary;
   }
 
-  private async process(
-    ref: ThreadRef, labelId: number | undefined, options: SyncOptions,
-    summary: SyncSummary, preview: Map<string, string>,
-  ): Promise<void> {
-    try {
-      if (tooOld(ref.receivedAt, options.sinceDays)) return;
-      summary.checked++;
-      const observationRevision = digest([
-        "posting-observation-v1", pipelineVersion, travelFilterVersion, ref.postingRevision,
-        ref.name, ref.summary, ref.sender, ref.includesAttachments, ref.includesCalendarInvites,
-      ]);
-      const observed = this.database.observation(ref.topicId);
-      if (observed?.revision === observationRevision) {
-        if (observed.state === "filtered") return;
-        if (observed.extractionKey && this.database.extractionMatches(
-          observed.extractionKey, pipelineVersion, this.config.model, this.config.defaultTimezone,
-        )) {
-          const cached = this.database.cachedExtraction(observed.extractionKey);
-          if (!cached) throw new Error(`extraction cache ${observed.extractionKey} is missing`);
-          if (!options.apply || observed.appliedKey !== observed.extractionKey) {
-            await this.handleExtraction(ref, observed.extractionKey, cached, labelId, options.apply, summary, preview);
-          }
-          return;
-        }
-      }
-      const decision = scoreTravelCandidate(ref);
-      const tracked = observed?.state === "extracted";
-      if (!tracked && !decision.candidate) {
-        this.database.saveObservation(ref.topicId, ref.boxItemId, observationRevision, "filtered");
-        summary.filtered++;
-        return;
-      }
-      console.log(`candidate ${ref.topicId}: ${tracked ? "tracked topic" : `score ${decision.score} (${decision.reasons.join(", ")})`}`);
-      const content = await this.hey.readThread(ref, this.config.workPath);
-      const extractionKey = digest([
-        pipelineVersion, content.contentHash, this.config.model, this.config.defaultTimezone,
-      ]);
-      let cached = this.database.cachedExtraction(extractionKey);
-      if (!cached) {
-        summary.modelCalls++;
-        const reservations = await this.extractor.extract(content.documents);
-        cached = {
-          reservations, sourceDate: content.contextDate,
-          hasExplicitCancellation: content.hasExplicitCancellation,
-        };
-        this.database.cacheExtraction(
-          extractionKey, content.contentHash, pipelineVersion, this.config.model,
-          this.config.defaultTimezone, reservations, content.contextDate, content.hasExplicitCancellation,
-        );
-      }
-      this.database.saveObservation(ref.topicId, ref.boxItemId, observationRevision, "extracted", extractionKey);
-      await this.handleExtraction(ref, extractionKey, cached, labelId, options.apply, summary, preview);
-    } catch (error) {
-      if (options.signal?.aborted) throw error;
-      console.error(`thread ${ref.topicId} failed:`, error instanceof Error ? error.message : error);
-      summary.errors++;
+  private async thread(ref: ThreadRef, options: SyncOptions, summary: Summary, labelId?: number): Promise<void> {
+    const row = this.store.thread(ref.topicId);
+    const forced = options.topicId !== undefined;
+    if (!forced && row?.revision === ref.revision) {
+      if (row.status !== "failed") return;
+      if (row.attempts >= maxAttempts) return;
+      // Back off an hour per attempt so a persistent failure doesn't call the model every poll.
+      if (Date.now() - Date.parse(`${row.updated_at}Z`) < row.attempts * 3_600_000) return;
     }
-  }
-
-  private async handleExtraction(
-    ref: ThreadRef, extractionKey: string, cached: CachedExtraction,
-    labelId: number | undefined, apply: boolean, summary: SyncSummary,
-    preview: Map<string, string>,
-  ): Promise<void> {
-    if (!cached.reservations.length) {
-      summary.ignored++;
-      if (apply) this.database.markApplied(ref.topicId, extractionKey);
+    // A thread that already produced travel stays tracked, so follow-ups like cancellations get read.
+    const score = travelScore(ref);
+    if (!forced && row?.status !== "travel" && !score.candidate) {
+      summary.filtered++;
+      if (options.apply) this.store.saveThread(ref.topicId, ref.revision, ref.subject, "filtered");
       return;
     }
-    if (apply) {
-      await this.applyExtraction(ref, extractionKey, cached, labelId, summary);
-      return;
-    }
-    for (const reservation of cached.reservations) {
-      await this.reconcile(reservation, cached.sourceDate, cached.hasExplicitCancellation, false, summary, preview);
-    }
-    summary.reservations += cached.reservations.length;
-  }
 
-  private async applyExtraction(
-    ref: ThreadRef, extractionKey: string, cached: CachedExtraction,
-    labelId: number | undefined, summary: SyncSummary,
-  ): Promise<void> {
-    let settled = true;
-    for (const reservation of cached.reservations) {
-      settled = await this.reconcile(
-        reservation, cached.sourceDate, cached.hasExplicitCancellation, true, summary,
-      ) && settled;
+    console.log(`thread ${ref.topicId} "${ref.subject}" (${score.reasons.join(", ") || "tracked"})`);
+    const thread = await this.hey.readThread(ref);
+    const bodyText = thread.markdown.replace(/^#.*$/gm, "").replace(/📎 attachment|!\[[^\]]*\]\([^)]*\)/g, "").trim();
+    if (bodyText.length < 80 && !thread.attachments.length) {
+      throw new Error("HEY returned an empty message body; check the hey CLI version");
     }
-    if (settled && labelId !== undefined) {
-      const labelOperation = digest(["label", ref.boxItemId, labelId]);
-      if (!this.database.operationDone(labelOperation)) {
-        await this.hey.addLabel(ref.boxItemId, labelId);
-        this.database.completeOperation(labelOperation, "label", String(ref.boxItemId));
+    const items = await this.extractor.extract(thread);
+    summary.extracted++;
+    const cancellationStated = /\bcancel(?:led|ed|lation)?\b/i.test(thread.markdown);
+    let reservations = 0;
+    for (const item of items) {
+      const reservation = normalize(item);
+      if (typeof reservation === "string") {
+        console.warn(`  skip ${item.kind} ${item.provider} ${item.number}: ${reservation}`);
+        continue;
       }
-      this.database.markApplied(ref.topicId, extractionKey);
+      reservations++;
+      await this.reconcile(reservation, thread.latestAt, cancellationStated, options.apply, summary);
     }
-    summary.reservations += cached.reservations.length;
+    if (!options.apply) return;
+    this.store.saveThread(ref.topicId, ref.revision, ref.subject, reservations || row?.status === "travel" ? "travel" : "none");
+    if (reservations && labelId !== undefined) await this.hey.addLabel(ref.postingId, labelId);
   }
 
-  private async reconcile(
-    reservation: IdentifiedReservation,
-    sourceDate: string,
-    hasExplicitCancellation: boolean,
-    apply: boolean,
-    summary: SyncSummary,
-    preview?: Map<string, string>,
-  ): Promise<boolean> {
-    if (this.database.isOlderThanRecorded(reservation, sourceDate)) {
-      console.log(`noop ${reservation.segmentKey}: newer reservation state is already recorded`);
-      return true;
-    }
-    let plan = this.plan(reservation, hasExplicitCancellation);
-    if (!apply && plan.action === "create" && plan.spec) {
-      const previousHash = preview?.get(reservation.segmentKey);
-      if (previousHash) {
-        plan = previousHash === plan.spec.contentHash
-          ? { action: "noop", reason: "duplicate reservation in this pass" }
-          : { ...plan, action: "update", reason: "later reservation state in this pass" };
-      }
-      preview?.set(reservation.segmentKey, plan.spec?.contentHash || previousHash || "");
-    }
-    console.log(`${plan.action} ${reservation.segmentKey}: ${plan.reason}`);
-    if (plan.action === "noop") {
-      if (apply && plan.reason === "unchanged") this.database.saveReservation(reservation, sourceDate);
-      return !reservation.cancelled;
-    }
-    summary[`${plan.action}s` as "creates" | "updates" | "deletes"]++;
-    if (!apply) return true;
-    const operationId = randomUUID();
-    const scopeSegment = plan.linkSegmentKey || reservation.segmentKey;
-    const scope = `calendar:${scopeSegment}`;
-    const matchedLink = plan.action === "delete" ? this.database.eventLink(scopeSegment) : undefined;
-    if (!this.database.beginOperation(operationId, scope, plan.action)) {
-      throw new Error(`an operation for ${scope} is pending from an interrupted run; verify the HEY event before retrying`);
-    }
-    const eventId = await this.hey.applyCalendar(plan, this.config.calendarId);
-    if (plan.action === "delete") {
-      const recorded = identify({ ...reservation, segment: reservation.segment || matchedLink?.currentSegment || "" });
-      this.database.unlinkEvent(scopeSegment);
-      this.database.saveReservation(recorded, sourceDate);
-      this.database.completeOperation(operationId, plan.action, String(plan.eventId || ""));
-      return true;
-    }
-    if (!plan.spec || eventId === undefined) throw new Error("calendar mutation did not return an event ID");
-    this.database.saveReservation(reservation, sourceDate);
-    this.database.linkEvent(reservation.segmentKey, reservation.reservationKey, eventId, plan.spec.contentHash, plan.linkSegmentKey);
-    this.database.completeOperation(operationId, plan.action, String(eventId));
-    return true;
-  }
-
-  private plan(reservation: IdentifiedReservation, hasExplicitCancellation: boolean): CalendarPlan {
+  private async reconcile(reservation: Reservation, sourceAt: string, cancellationStated: boolean, apply: boolean, summary: Summary): Promise<void> {
+    const { key, label } = reservation;
     if (reservation.cancelled) {
-      if (!hasExplicitCancellation) return { action: "noop", reason: "source does not explicitly state cancellation" };
-      const candidates = this.matchingReferenceLinks(reservation);
-      if (candidates.length > 1) return { action: "noop", reason: "cancellation is ambiguous across owned segments" };
-      const link = candidates[0];
-      if (!link) return { action: "noop", reason: "no owned event matches cancellation" };
-      return { action: "delete", eventId: link.eventId, linkSegmentKey: link.segmentKey, reason: "confirmed cancellation" };
+      if (!cancellationStated) return console.warn(`  ignore cancellation of ${label}: the email never says "cancel"`);
+      const exact = this.store.event(key);
+      const targets = exact ? [exact] : this.store.eventsWithPrefix(bookingPrefix(reservation.kind, reservation.confirmation));
+      if (!targets.length) return console.log(`  cancellation of ${label}: no event on file`);
+      for (const target of targets) {
+        if (target.event_id === null) throw new Error(`event for ${target.key} has an unfinished create; check HEY Calendar, then delete its row`);
+        console.log(`  delete ${target.label} (event ${target.event_id})`);
+        summary.deleted++;
+        if (!apply) continue;
+        await this.hey.deleteEvent(target.event_id);
+        this.store.deleteEvent(target.key);
+      }
+      return;
     }
-    const spec = eventSpec(reservation, this.config.defaultTimezone);
-    let link = this.database.eventLink(reservation.segmentKey);
-    if (!link && reservation.confirmation) {
-      const candidates = this.confirmedReferenceLinks(reservation);
-      if (candidates.length === 1) link = candidates[0];
-      else if (candidates.length > 1) return { action: "noop", reason: "reservation reference is ambiguous across owned events" };
+
+    const event = reservation.event!;
+    const hash = eventHash(event);
+    const existing = this.store.event(key);
+    if (existing?.event_id === null) throw new Error(`event for ${key} has an unfinished create; check HEY Calendar, then delete its row`);
+    if (existing && existing.source_at > sourceAt) return console.log(`  keep ${label}: a newer email already set it`);
+    if (existing?.hash === hash) return;
+    const when = event.allDay ? `${event.startDate} → ${event.endDate}` : `${event.startDate} ${event.startTime} → ${event.endDate} ${event.endTime} ${event.timeZone}`;
+    if (existing) {
+      console.log(`  update "${event.title}" ${when}`);
+      summary.updated++;
+      if (!apply) return;
+      await this.hey.editEvent(existing.event_id!, event);
+      this.store.saveEvent(key, existing.event_id!, hash, sourceAt, label);
+      return;
     }
-    if (!link) return { action: "create", spec, reason: "new managed segment" };
-    if (!reservation.confirmation) return { action: "noop", spec, eventId: link.eventId, reason: "confirmation-free events are create-only" };
-    if (!link.owned) return { action: "noop", reason: "existing event is not owned" };
-    if (link.contentHash === spec.contentHash) return { action: "noop", spec, eventId: link.eventId, reason: "unchanged" };
-    return {
-      action: "update", spec, eventId: link.eventId, linkSegmentKey: link.segmentKey,
-      lookupDate: link.currentStart || reservation.start, reason: "reservation changed",
-    };
+    console.log(`  create "${event.title}" ${when}`);
+    summary.created++;
+    if (!apply) return;
+    this.store.beginCreate(key, sourceAt, label);
+    const eventId = await this.hey.createEvent(event, this.config.calendarId);
+    this.store.saveEvent(key, eventId, hash, sourceAt, label);
   }
-
-  private matchingReferenceLinks(reservation: IdentifiedReservation): EventLink[] {
-    let candidates = this.database.linksForConfirmation(reservation.kind, reservation.confirmation).filter((item) => item.owned);
-    candidates = candidates.filter((item) => item.currentProvider.trim().toLowerCase() === reservation.provider.trim().toLowerCase());
-    if (reservation.segment) candidates = candidates.filter(
-      (item) => normalizeSegment(item.currentSegment) === normalizeSegment(reservation.segment),
-    );
-    return candidates;
-  }
-
-  private confirmedReferenceLinks(reservation: IdentifiedReservation): EventLink[] {
-    const candidates = this.database.linksForConfirmation(reservation.kind, reservation.confirmation).filter((item) => item.owned);
-    const providerMatches = candidates.filter(
-      (item) => item.currentProvider.trim().toLowerCase() === reservation.provider.trim().toLowerCase(),
-    );
-    return providerMatches.length ? providerMatches : candidates;
-  }
-}
-
-function emptySummary(): SyncSummary {
-  return { checked: 0, filtered: 0, modelCalls: 0, ignored: 0, reservations: 0, creates: 0, updates: 0, deletes: 0, errors: 0 };
-}
-
-function chronological(a: ThreadRef, b: ThreadRef): number {
-  const first = Date.parse(a.receivedAt), second = Date.parse(b.receivedAt);
-  return Number.isNaN(first) || Number.isNaN(second) ? b.order - a.order : first - second;
-}
-
-function tooOld(receivedAt: string, sinceDays?: number): boolean {
-  if (sinceDays === undefined || !receivedAt) return false;
-  const received = Date.parse(receivedAt);
-  return !Number.isNaN(received) && received < Date.now() - sinceDays * 86_400_000;
 }
