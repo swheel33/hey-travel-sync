@@ -129,6 +129,8 @@ export class Sync {
       this.store.saveEvent(key, existing.event_id!, hash, sourceAt, label);
       return;
     }
+    // Backfills reach old mail; a trip that is already over isn't worth a new event.
+    if (event.endDate < new Date().toISOString().slice(0, 10)) return console.log(`  skip past "${event.title}" ${when}`);
     console.log(`  create "${event.title}" ${when}`);
     summary.created++;
     if (!apply) return;
